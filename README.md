@@ -55,6 +55,22 @@ npm run dev            # http://localhost:5000
 | GET | `/api/admin/equipment` | Admin JWT | All equipment (`?status=pending`) |
 | GET | `/api/admin/stats` | Admin JWT | Totals for the admin dashboard |
 | PATCH | `/api/admin/equipment/:id` | Admin JWT | Approve or reject a listing |
+| POST | `/api/bookings` | JWT | Create a booking request (status `pending`) |
+| GET | `/api/bookings/my` | JWT | Bookings requested by the current user |
+| DELETE | `/api/bookings/:id` | JWT | Cancel own pending booking |
+| GET | `/api/owner/bookings` | Owner JWT | Booking requests for the owner's equipment |
+| PATCH | `/api/owner/bookings/:id` | Owner JWT | Approve, reject or complete a booking |
+| GET | `/api/admin/bookings` | Admin JWT | All bookings |
+
+### Booking flow (no payment yet)
+
+1. Customer sends `POST /api/bookings` with dates, quantity, phone and address.
+2. Owner approves or rejects from `GET /api/owner/bookings`.
+3. Approving reserves the quantity (`availableQuantity` goes down).
+4. Owner marks an approved booking as `completed`; the quantity goes back to stock.
+5. Customers can cancel only while the booking is still `pending`.
+
+Status flow: `pending → approved | rejected`, then `approved → completed`.
 
 ### Query parameters for `GET /api/equipment`
 
