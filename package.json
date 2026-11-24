@@ -13,6 +13,7 @@
   "scripts": {
     "dev": "node --watch index.js",
     "start": "node index.js",
+    "seed": "node scripts/seed-equipment.js",
     "set-role": "node scripts/set-role.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

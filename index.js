@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import { connectToMongoDB } from "./db.js";
 import meRouter from "./routes/me.js";
+import equipmentRouter from "./routes/equipment.js";
 
 const app = express();
 
@@ -43,6 +44,7 @@ app.get("/api/health", (req, res) => {
 });
 
 app.use("/api", meRouter);
+app.use("/api", equipmentRouter);
 
 // 404 handler
 app.use((req, res) => {
