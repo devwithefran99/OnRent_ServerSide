@@ -11,6 +11,8 @@ access tokens issued by better-auth.
 - Role based middleware: `verifyToken`, `verifyRenter`, `verifyOwner`, `verifyAdmin`
 - Equipment API with backend search, filtering, sorting and pagination
 - Owner-only equipment create, update and delete (new listings start as `pending`)
+- Favorites API for logged-in users
+- Admin equipment list with approve/reject
 - Protected routes: `GET /api/me`, `GET /api/admin/ping`
 - CORS allowlist via `CLIENT_ORIGIN`
 - Central 404 and error handlers
@@ -47,6 +49,11 @@ npm run dev            # http://localhost:5000
 | GET | `/api/owner/equipment` | Owner JWT | List the owner's own equipment |
 | PATCH | `/api/equipment/:id` | Owner JWT | Update own equipment |
 | DELETE | `/api/equipment/:id` | Owner JWT | Delete own equipment |
+| GET | `/api/favorites` | JWT | Favorite equipment of the current user |
+| POST | `/api/favorites/:equipmentId` | JWT | Add equipment to favorites |
+| DELETE | `/api/favorites/:equipmentId` | JWT | Remove equipment from favorites |
+| GET | `/api/admin/equipment` | Admin JWT | All equipment (`?status=pending`) |
+| PATCH | `/api/admin/equipment/:id` | Admin JWT | Approve or reject a listing |
 
 ### Query parameters for `GET /api/equipment`
 
