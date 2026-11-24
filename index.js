@@ -6,6 +6,9 @@ import meRouter from "./routes/me.js";
 
 const app = express();
 
+// Needed on Render/Railway so client IPs and rate limits work correctly.
+app.set("trust proxy", 1);
+
 // Allow the Next.js app (and only it) to call this API with cookies/JWT.
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:3000")
   .split(",")
@@ -18,13 +21,16 @@ app.use(
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
-      return callback(new Error("Not allowed by CORS"));
+
+      const error = new Error("Origin not allowed by CORS");
+      error.status = 403;
+      return callback(error);
     },
     credentials: true,
   })
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 5000;
 
