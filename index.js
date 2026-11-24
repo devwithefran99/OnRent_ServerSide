@@ -139,6 +139,18 @@ app.get("/api/admin/equipment", verifyToken, verifyAdmin, async (req, res) => {
   res.json({ items: items.map(equipmentToClient) });
 });
 
+// GET /api/admin/stats -> small numbers for the admin dashboard
+app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
+  const [users, equipment, pending, bookings] = await Promise.all([
+    db.collection("user").countDocuments(),
+    db.collection("equipment").countDocuments(),
+    db.collection("equipment").countDocuments({ status: "pending" }),
+    db.collection("bookings").countDocuments(),
+  ]);
+
+  res.json({ users, equipment, pending, bookings });
+});
+
 // PATCH /api/admin/equipment/:id  { "status": "approved" | "rejected" }
 app.patch(
   "/api/admin/equipment/:id",
