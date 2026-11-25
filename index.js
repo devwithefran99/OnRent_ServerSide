@@ -126,42 +126,258 @@ app.delete("/api/favorites/:equipmentId", verifyToken, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Home page categories
-// Build category cards from approved equipment in the database.
+// Categories
+// Admins manage the category list. Equipment stores the category name as text,
+// so renaming a category also updates every equipment item that uses it.
 // ---------------------------------------------------------------------------
-app.get("/api/categories", async (req, res) => {
-  // Newest approved equipment first.
-  const items = await db
+
+const DEFAULT_CATEGORIES = [
+  {
+    name: "Construction Equipment",
+    description: "Heavy machinery for every construction project.",
+  },
+  {
+    name: "Photography Equipment",
+    description: "Professional cameras and photography gear.",
+  },
+  {
+    name: "Vehicles & Transportation",
+    description: "Reliable vehicles for work and transportation.",
+  },
+  {
+    name: "Agriculture Equipment",
+    description: "Modern tools for smarter farming.",
+  },
+  {
+    name: "Electronics",
+    description: "Essential electronics for work and creativity.",
+  },
+  {
+    name: "Event Equipment",
+    description: "Everything you need for memorable events.",
+  },
+];
+
+// Escape special characters before using a name inside a regex.
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// First run: create the six starter categories.
+async function ensureDefaultCategories() {
+  const count = await db.collection("categories").countDocuments();
+
+  if (count > 0) return;
+
+  await db.collection("categories").insertMany(
+    DEFAULT_CATEGORIES.map((category) => ({
+      ...category,
+      image: "",
+      createdAt: new Date(),
+    }))
+  );
+
+  console.log("Default categories created");
+}
+
+// Category list + how many equipment use each category.
+async function buildCategoryList(equipmentFilter = {}) {
+  const categories = await db
+    .collection("categories")
+    .find({})
+    .sort({ name: 1 })
+    .toArray();
+
+  const equipment = await db
     .collection("equipment")
-    .find({ status: "approved" })
+    .find(equipmentFilter)
     .sort({ createdAt: -1 })
     .toArray();
 
-  // Group the equipment by category name.
-  const categories = new Map();
+  const counts = new Map();
+  const coverImages = new Map();
 
-  for (const item of items) {
+  for (const item of equipment) {
     if (!item.category) continue;
 
-    if (!categories.has(item.category)) {
-      // The newest item in a category becomes its cover image.
-      categories.set(item.category, {
-        name: item.category,
-        image: item.image,
-        count: 0,
+    counts.set(item.category, (counts.get(item.category) ?? 0) + 1);
+
+    // Newest item's image becomes the fallback cover for the category.
+    if (!coverImages.has(item.category) && item.image) {
+      coverImages.set(item.category, item.image);
+    }
+  }
+
+  return categories.map((category) => ({
+    id: String(category._id),
+    name: category.name,
+    description: category.description ?? "",
+    image: category.image || coverImages.get(category.name) || "",
+    count: counts.get(category.name) ?? 0,
+  }));
+}
+
+// GET /api/categories -> public list for the home page and owner forms
+app.get("/api/categories", async (req, res) => {
+  const items = await buildCategoryList({ status: "approved" });
+
+  // Most popular categories first.
+  items.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+  res.json({ items });
+});
+
+// GET /api/admin/categories -> every category (including empty ones)
+app.get("/api/admin/categories", verifyToken, verifyAdmin, async (req, res) => {
+  res.json({ items: await buildCategoryList({}) });
+});
+
+// POST /api/admin/categories -> create a category
+app.post("/api/admin/categories", verifyToken, verifyAdmin, async (req, res) => {
+  const name = String(req.body?.name ?? "").trim();
+  const description = String(req.body?.description ?? "").trim();
+  const image = String(req.body?.image ?? "").trim();
+
+  if (!name) {
+    return res.status(400).json({ message: "Category name is required" });
+  }
+
+  if (image && !/^https?:\/\//i.test(image)) {
+    return res
+      .status(400)
+      .json({ message: "Image must be a valid link starting with http" });
+  }
+
+  // Do not allow the same category twice (ignoring capital letters).
+  const duplicate = await db.collection("categories").findOne({
+    name: { $regex: `^${escapeRegex(name)}$`, $options: "i" },
+  });
+
+  if (duplicate) {
+    return res.status(409).json({ message: "This category already exists" });
+  }
+
+  const result = await db.collection("categories").insertOne({
+    name,
+    description,
+    image,
+    createdAt: new Date(),
+  });
+
+  res.status(201).json({
+    id: String(result.insertedId),
+    message: "Category created",
+  });
+});
+
+// PATCH /api/admin/categories/:id -> rename or update a category
+app.patch(
+  "/api/admin/categories/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid category id" });
+    }
+
+    const category = await db
+      .collection("categories")
+      .findOne({ _id: new ObjectId(id) });
+
+    if (!category) {
+      return res.status(404).json({ message: "Category not found" });
+    }
+
+    const name =
+      req.body?.name !== undefined
+        ? String(req.body.name).trim()
+        : category.name;
+    const description =
+      req.body?.description !== undefined
+        ? String(req.body.description).trim()
+        : category.description ?? "";
+    const image =
+      req.body?.image !== undefined
+        ? String(req.body.image).trim()
+        : category.image ?? "";
+
+    if (!name) {
+      return res.status(400).json({ message: "Category name is required" });
+    }
+
+    if (image && !/^https?:\/\//i.test(image)) {
+      return res
+        .status(400)
+        .json({ message: "Image must be a valid link starting with http" });
+    }
+
+    if (name.toLowerCase() !== category.name.toLowerCase()) {
+      const duplicate = await db.collection("categories").findOne({
+        _id: { $ne: category._id },
+        name: { $regex: `^${escapeRegex(name)}$`, $options: "i" },
+      });
+
+      if (duplicate) {
+        return res.status(409).json({ message: "This category already exists" });
+      }
+    }
+
+    await db.collection("categories").updateOne(
+      { _id: category._id },
+      { $set: { name, description, image, updatedAt: new Date() } }
+    );
+
+    // Renaming a category must also rename it on every equipment item.
+    if (name !== category.name) {
+      await db
+        .collection("equipment")
+        .updateMany(
+          { category: category.name },
+          { $set: { category: name } }
+        );
+    }
+
+    res.json({ message: "Category updated" });
+  }
+);
+
+// DELETE /api/admin/categories/:id -> only when no equipment uses it
+app.delete(
+  "/api/admin/categories/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid category id" });
+    }
+
+    const category = await db
+      .collection("categories")
+      .findOne({ _id: new ObjectId(id) });
+
+    if (!category) {
+      return res.status(404).json({ message: "Category not found" });
+    }
+
+    const usedBy = await db
+      .collection("equipment")
+      .countDocuments({ category: category.name });
+
+    if (usedBy > 0) {
+      return res.status(400).json({
+        message: `Cannot delete "${category.name}" — ${usedBy} equipment still use it`,
       });
     }
 
-    categories.get(item.category).count += 1;
+    await db.collection("categories").deleteOne({ _id: category._id });
+
+    res.json({ message: "Category deleted" });
   }
-
-  // Show the categories with the most equipment first.
-  const result = Array.from(categories.values()).sort(
-    (a, b) => b.count - a.count
-  );
-
-  res.json({ items: result });
-});
+);
 
 // ---------------------------------------------------------------------------
 // Admin equipment approval (P3)
@@ -570,6 +786,7 @@ app.use((err, req, res, next) => {
 async function start() {
   try {
     await connectToMongoDB();
+    await ensureDefaultCategories();
 
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);

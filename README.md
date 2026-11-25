@@ -44,7 +44,11 @@ npm run dev            # http://localhost:5000
 | GET | `/api/admin/ping` | Admin JWT | Role guard test |
 | GET | `/api/equipment` | Public | Search, filter, sort and paginate approved equipment |
 | GET | `/api/equipment/featured` | Public | Latest 6 available items for the home page |
-| GET | `/api/categories` | Public | Home page categories with counts and cover images |
+| GET | `/api/categories` | Public | Categories with equipment counts and cover images |
+| GET | `/api/admin/categories` | Admin JWT | All categories, including empty ones |
+| POST | `/api/admin/categories` | Admin JWT | Create a category |
+| PATCH | `/api/admin/categories/:id` | Admin JWT | Update a category (rename updates equipment too) |
+| DELETE | `/api/admin/categories/:id` | Admin JWT | Delete an empty category |
 | GET | `/api/equipment/:id` | Public | Single equipment details |
 | POST | `/api/equipment` | Owner JWT | Create a listing (status `pending`) |
 | GET | `/api/owner/equipment` | Owner JWT | List the owner's own equipment |
