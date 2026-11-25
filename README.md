@@ -12,7 +12,9 @@ access tokens issued by better-auth.
 - Equipment API with backend search, filtering, sorting and pagination
 - Owner-only equipment create, update and delete (new listings start as `pending`)
 - Favorites API for logged-in users
-- Admin equipment list with approve/reject
+- Admin equipment list with approve/reject, full edit and delete
+- Admin user role management (`customer`, `owner`, `admin`)
+- Platform settings stored in the `settings` collection (`_id: "platform"`)
 - Protected routes: `GET /api/me`, `GET /api/admin/ping`
 - CORS allowlist via `CLIENT_ORIGIN`
 - Central 404 and error handlers
@@ -61,23 +63,38 @@ npm run dev            # http://localhost:5000
 | GET | `/api/admin/equipment` | Admin JWT | All equipment (`?status=pending`) |
 | GET | `/api/admin/users` | Admin JWT | All accounts with listing and booking counts |
 | GET | `/api/admin/stats` | Admin JWT | Totals for the admin dashboard |
-| PATCH | `/api/admin/equipment/:id` | Admin JWT | Approve or reject a listing |
-| POST | `/api/bookings` | JWT | Create a booking request (status `pending`) |
+| PATCH | `/api/admin/equipment/:id` | Admin JWT | Approve/reject, or edit any listing field |
+| DELETE | `/api/admin/equipment/:id` | Admin JWT | Delete any listing |
+| PATCH | `/api/admin/users/:id/role` | Admin JWT | Change a user role (own account is blocked) |
+| GET | `/api/admin/settings` | Admin JWT | Platform settings with defaults |
+| PATCH | `/api/admin/settings` | Admin JWT | Update platform settings |
+| POST | `/api/bookings` | JWT | Create a booking request (status `pending`, payment `unpaid`) |
 | GET | `/api/bookings/my` | JWT | Bookings requested by the current user |
 | DELETE | `/api/bookings/:id` | JWT | Cancel own pending booking |
 | GET | `/api/owner/bookings` | Owner JWT | Booking requests for the owner's equipment |
 | PATCH | `/api/owner/bookings/:id` | Owner JWT | Approve, reject or complete a booking |
 | GET | `/api/admin/bookings` | Admin JWT | All bookings (`?status=pending`) |
 
-### Booking flow (no payment yet)
+### Booking flow (payment placeholder)
 
 1. Customer sends `POST /api/bookings` with dates, quantity, phone and address.
-2. Owner approves or rejects from `GET /api/owner/bookings`.
-3. Approving reserves the quantity (`availableQuantity` goes down).
-4. Owner marks an approved booking as `completed`; the quantity goes back to stock.
-5. Customers can cancel only while the booking is still `pending`.
+2. New bookings are stored with `paymentStatus: "unpaid"`.
+3. Owner approves or rejects from `GET /api/owner/bookings`.
+4. Approving reserves the quantity (`availableQuantity` goes down).
+5. Owner marks an approved booking as `completed`; the quantity goes back to stock.
+6. Customers can cancel only while the booking is still `pending`.
 
 Status flow: `pending → approved | rejected`, then `approved → completed`.
+Stripe checkout will set `paymentStatus` to `paid` and store the transaction in
+the `payments` collection.
+
+### Platform settings
+
+`GET /api/admin/settings` returns the `settings` document with `_id: "platform"`,
+falling back to sensible defaults. `PATCH` accepts:
+
+`siteName`, `supportEmail`, `supportPhone`, `address`, `currency`,
+`defaultRentalTerms`, `autoApproveListings`.
 
 ### Query parameters for `GET /api/equipment`
 
