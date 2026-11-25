@@ -126,6 +126,47 @@ app.delete("/api/favorites/:equipmentId", verifyToken, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Dashboard stats
+// One endpoint for both the customer and owner overview cards.
+// ---------------------------------------------------------------------------
+app.get("/api/dashboard/stats", verifyToken, async (req, res) => {
+  const userId = req.user.id;
+
+  const [
+    activeRentals,
+    completedRentals,
+    favorites,
+    listedEquipment,
+    pendingApproval,
+    rentalRequests,
+  ] = await Promise.all([
+    db
+      .collection("bookings")
+      .countDocuments({ customerId: userId, status: "approved" }),
+    db
+      .collection("bookings")
+      .countDocuments({ customerId: userId, status: "completed" }),
+    db.collection("favorites").countDocuments({ userId }),
+    db.collection("equipment").countDocuments({ ownerId: userId }),
+    db
+      .collection("equipment")
+      .countDocuments({ ownerId: userId, status: "pending" }),
+    db
+      .collection("bookings")
+      .countDocuments({ ownerId: userId, status: "pending" }),
+  ]);
+
+  res.json({
+    activeRentals,
+    completedRentals,
+    favorites,
+    listedEquipment,
+    pendingApproval,
+    rentalRequests,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Categories
 // Admins manage the category list. Equipment stores the category name as text,
 // so renaming a category also updates every equipment item that uses it.

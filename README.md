@@ -41,6 +41,7 @@ npm run dev            # http://localhost:5000
 | GET | `/` | Public | Health message |
 | GET | `/api/health` | Public | Service health check |
 | GET | `/api/me` | JWT | Current user profile |
+| GET | `/api/dashboard/stats` | JWT | Live counts for customer and owner dashboard cards |
 | GET | `/api/admin/ping` | Admin JWT | Role guard test |
 | GET | `/api/equipment` | Public | Search, filter, sort and paginate approved equipment |
 | GET | `/api/equipment/featured` | Public | Latest 6 available items for the home page |
