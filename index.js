@@ -126,6 +126,44 @@ app.delete("/api/favorites/:equipmentId", verifyToken, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Home page categories
+// Build category cards from approved equipment in the database.
+// ---------------------------------------------------------------------------
+app.get("/api/categories", async (req, res) => {
+  // Newest approved equipment first.
+  const items = await db
+    .collection("equipment")
+    .find({ status: "approved" })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  // Group the equipment by category name.
+  const categories = new Map();
+
+  for (const item of items) {
+    if (!item.category) continue;
+
+    if (!categories.has(item.category)) {
+      // The newest item in a category becomes its cover image.
+      categories.set(item.category, {
+        name: item.category,
+        image: item.image,
+        count: 0,
+      });
+    }
+
+    categories.get(item.category).count += 1;
+  }
+
+  // Show the categories with the most equipment first.
+  const result = Array.from(categories.values()).sort(
+    (a, b) => b.count - a.count
+  );
+
+  res.json({ items: result });
+});
+
+// ---------------------------------------------------------------------------
 // Admin equipment approval (P3)
 // Admins can see all listings and approve or reject them.
 // ---------------------------------------------------------------------------
