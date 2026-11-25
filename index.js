@@ -157,6 +157,50 @@ app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
   res.json({ users, equipment, pending, bookings });
 });
 
+// GET /api/admin/users -> every account for the admin "All Users" page
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  // Newest accounts first.
+  const users = await db
+    .collection("user")
+    .find({})
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  // Count how many listings each owner has.
+  const equipmentCounts = await db
+    .collection("equipment")
+    .aggregate([{ $group: { _id: "$ownerId", count: { $sum: 1 } } }])
+    .toArray();
+
+  // Count how many bookings each customer has made.
+  const bookingCounts = await db
+    .collection("bookings")
+    .aggregate([{ $group: { _id: "$customerId", count: { $sum: 1 } } }])
+    .toArray();
+
+  // Small lookup maps: userId -> number.
+  const listingsByUser = new Map(
+    equipmentCounts.map((row) => [String(row._id), row.count])
+  );
+  const bookingsByUser = new Map(
+    bookingCounts.map((row) => [String(row._id), row.count])
+  );
+
+  res.json({
+    items: users.map((user) => ({
+      id: String(user._id),
+      name: user.name,
+      email: user.email,
+      image: user.image ?? null,
+      role: user.role ?? "customer",
+      emailVerified: Boolean(user.emailVerified),
+      createdAt: user.createdAt,
+      listings: listingsByUser.get(String(user._id)) ?? 0,
+      bookings: bookingsByUser.get(String(user._id)) ?? 0,
+    })),
+  });
+});
+
 // PATCH /api/admin/equipment/:id  { "status": "approved" | "rejected" }
 app.patch(
   "/api/admin/equipment/:id",
@@ -452,11 +496,20 @@ app.patch(
   }
 );
 
-// GET /api/admin/bookings -> all bookings for the admin dashboard
+// GET /api/admin/bookings?status=pending -> all bookings for the admin panel
 app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+  const status = req.query.status;
+
+  // Only apply the filter when it is a real booking status.
+  const filter = ["pending", "approved", "rejected", "completed"].includes(
+    status
+  )
+    ? { status }
+    : {};
+
   const items = await db
     .collection("bookings")
-    .find({})
+    .find(filter)
     .sort({ createdAt: -1 })
     .toArray();
 
