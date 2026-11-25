@@ -496,39 +496,242 @@ app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   });
 });
 
-// PATCH /api/admin/equipment/:id  { "status": "approved" | "rejected" }
+// PATCH /api/admin/equipment/:id
+// Approve/reject, or edit any listing field.
+const ADMIN_EQUIPMENT_FIELDS = [
+  "name",
+  "description",
+  "category",
+  "location",
+  "price",
+  "rentalType",
+  "quantity",
+  "availableQuantity",
+  "condition",
+  "brand",
+  "model",
+  "image",
+  "terms",
+  "status",
+];
+
+const EQUIPMENT_STATUSES = ["approved", "rejected", "pending"];
+
 app.patch(
   "/api/admin/equipment/:id",
   verifyToken,
   verifyAdmin,
   async (req, res) => {
     const { id } = req.params;
-    const { status } = req.body ?? {};
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid equipment id" });
     }
 
-    if (!["approved", "rejected", "pending"].includes(status)) {
+    const body = req.body ?? {};
+    const updates = {};
+
+    for (const key of ADMIN_EQUIPMENT_FIELDS) {
+      if (body[key] !== undefined) updates[key] = body[key];
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: "Nothing to update" });
+    }
+
+    if (
+      updates.status !== undefined &&
+      !EQUIPMENT_STATUSES.includes(updates.status)
+    ) {
       return res.status(400).json({
         message: 'status must be "approved", "rejected" or "pending"',
       });
     }
 
+    for (const key of ["price", "quantity", "availableQuantity"]) {
+      if (updates[key] !== undefined) {
+        const value = Number(updates[key]);
+
+        if (!Number.isFinite(value) || value < 0) {
+          return res
+            .status(400)
+            .json({ message: `${key} must be a positive number` });
+        }
+
+        updates[key] = value;
+      }
+    }
+
+    if (
+      updates.image !== undefined &&
+      !/^https?:\/\//i.test(String(updates.image))
+    ) {
+      return res
+        .status(400)
+        .json({ message: "Image must be a valid link starting with http" });
+    }
+
+    updates.updatedAt = new Date();
+
     const result = await db
       .collection("equipment")
-      .updateOne(
-        { _id: { $in: idVariants(id) } },
-        { $set: { status, updatedAt: new Date() } }
-      );
+      .updateOne({ _id: { $in: idVariants(id) } }, { $set: updates });
 
     if (result.matchedCount === 0) {
       return res.status(404).json({ message: "Equipment not found" });
     }
 
-    res.json({ message: `Equipment marked as ${status}` });
+    res.json({ message: "Equipment updated" });
   }
 );
+
+// DELETE /api/admin/equipment/:id -> admin can remove any listing
+app.delete(
+  "/api/admin/equipment/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid equipment id" });
+    }
+
+    const result = await db
+      .collection("equipment")
+      .deleteOne({ _id: { $in: idVariants(id) } });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Equipment not found" });
+    }
+
+    res.json({ message: "Equipment deleted" });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Admin user management
+// ---------------------------------------------------------------------------
+
+const ROLES = ["customer", "owner", "admin"];
+
+// PATCH /api/admin/users/:id/role  { "role": "customer" | "owner" | "admin" }
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { id } = req.params;
+    const { role } = req.body ?? {};
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    if (!ROLES.includes(role)) {
+      return res
+        .status(400)
+        .json({ message: 'role must be "customer", "owner" or "admin"' });
+    }
+
+    // Safety: an admin cannot lock themselves out of the dashboard.
+    if (String(req.user.id) === id) {
+      return res
+        .status(400)
+        .json({ message: "You cannot change your own role" });
+    }
+
+    const result = await db
+      .collection("user")
+      .updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { role, updatedAt: new Date() } }
+      );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json({ message: `Role changed to ${role}`, role });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Platform settings (admin only)
+// ---------------------------------------------------------------------------
+
+const SETTINGS_ID = "platform";
+
+const DEFAULT_SETTINGS = {
+  siteName: "OnRent",
+  supportEmail: "support@onrent.com",
+  supportPhone: "+880 1700-000000",
+  address: "Chattogram, Bangladesh",
+  currency: "BDT",
+  defaultRentalTerms:
+    "Equipment must be returned in the same condition. Late returns may incur an extra day's charge.",
+  autoApproveListings: false,
+};
+
+async function getPlatformSettings() {
+  const doc = await db.collection("settings").findOne({ _id: SETTINGS_ID });
+
+  if (!doc) return { ...DEFAULT_SETTINGS };
+
+  const { _id, ...rest } = doc;
+  return { ...DEFAULT_SETTINGS, ...rest };
+}
+
+// GET /api/admin/settings -> platform settings with defaults
+app.get("/api/admin/settings", verifyToken, verifyAdmin, async (req, res) => {
+  res.json({ settings: await getPlatformSettings() });
+});
+
+// PATCH /api/admin/settings -> update the platform settings
+app.patch("/api/admin/settings", verifyToken, verifyAdmin, async (req, res) => {
+  const allowed = [
+    "siteName",
+    "supportEmail",
+    "supportPhone",
+    "address",
+    "currency",
+    "defaultRentalTerms",
+    "autoApproveListings",
+  ];
+
+  const updates = {};
+
+  for (const key of allowed) {
+    if (req.body?.[key] !== undefined) updates[key] = req.body[key];
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ message: "Nothing to update" });
+  }
+
+  if (
+    updates.supportEmail !== undefined &&
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(updates.supportEmail))
+  ) {
+    return res.status(400).json({ message: "Support email is not valid" });
+  }
+
+  if (updates.autoApproveListings !== undefined) {
+    updates.autoApproveListings = Boolean(updates.autoApproveListings);
+  }
+
+  updates.updatedAt = new Date();
+
+  await db
+    .collection("settings")
+    .updateOne({ _id: SETTINGS_ID }, { $set: updates }, { upsert: true });
+
+  res.json({
+    message: "Settings saved",
+    settings: await getPlatformSettings(),
+  });
+});
+
 
 // ---------------------------------------------------------------------------
 // Bookings (P5 without payment)
@@ -630,6 +833,7 @@ app.post("/api/bookings", verifyToken, async (req, res) => {
     address,
     note: note ?? "",
     status: "pending",
+    paymentStatus: "unpaid",
     createdAt: new Date(),
   };
 
