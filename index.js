@@ -1,4 +1,5 @@
 import "dotenv/config";
+import crypto from "node:crypto";
 import express from "express";
 import cors from "cors";
 import { ObjectId } from "mongodb";
@@ -34,7 +35,16 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "1mb" }));
+// Keep the raw request body around so the Stripe webhook can verify its
+// signature (Stripe signs the exact bytes it sent, not the parsed JSON).
+app.use(
+  express.json({
+    limit: "1mb",
+    verify: (req, res, buffer) => {
+      req.rawBody = buffer;
+    },
+  })
+);
 
 const PORT = process.env.PORT || 5000;
 
@@ -1013,6 +1023,544 @@ app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
     .toArray();
 
   res.json({ items: items.map(bookingToClient) });
+});
+
+// ---------------------------------------------------------------------------
+// Payments (Stripe Checkout)
+// Flow A: customer books -> owner approves -> customer pays online.
+//
+// Stripe is called through its REST API with plain fetch so this file stays the
+// only server file that needs to change (no extra npm dependency).
+// ---------------------------------------------------------------------------
+
+const STRIPE_API = "https://api.stripe.com/v1";
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const STRIPE_CURRENCY = (process.env.STRIPE_CURRENCY || "usd").toLowerCase();
+// The demo Stripe account is US-based, so BDT booking amounts are converted
+// before charging. Override the rate with STRIPE_BDT_PER_USD.
+const STRIPE_BDT_PER_USD =
+  Number(process.env.STRIPE_BDT_PER_USD) > 0
+    ? Number(process.env.STRIPE_BDT_PER_USD)
+    : 120;
+// Where Stripe sends the customer after checkout (the first allowed origin).
+const PAYMENT_RETURN_URL = allowedOrigins[0] || "http://localhost:3000";
+
+// Turn nested params into Stripe's application/x-www-form-urlencoded format,
+// e.g. { line_items: [{ quantity: 1 }] } -> line_items[0][quantity]=1
+function toStripeForm(params, prefix = "", target = new URLSearchParams()) {
+  for (const [key, value] of Object.entries(params ?? {})) {
+    if (value === undefined || value === null) continue;
+
+    const name = prefix ? `${prefix}[${key}]` : key;
+
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => {
+        if (item !== null && typeof item === "object") {
+          toStripeForm(item, `${name}[${index}]`, target);
+        } else {
+          target.append(`${name}[${index}]`, String(item));
+        }
+      });
+    } else if (typeof value === "object") {
+      toStripeForm(value, name, target);
+    } else {
+      target.append(name, String(value));
+    }
+  }
+
+  return target;
+}
+
+async function stripeRequest(path, params = {}, method = "POST") {
+  if (!STRIPE_SECRET_KEY) {
+    const error = new Error("Stripe is not configured on the server");
+    error.status = 503;
+    throw error;
+  }
+
+  const query = toStripeForm(params).toString();
+  const url =
+    method === "GET"
+      ? `${STRIPE_API}${path}${query ? `?${query}` : ""}`
+      : `${STRIPE_API}${path}`;
+
+  const response = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+      ...(method === "GET"
+        ? {}
+        : { "Content-Type": "application/x-www-form-urlencoded" }),
+    },
+    body: method === "GET" ? undefined : query,
+  });
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const error = new Error(
+      data?.error?.message || "Stripe request failed"
+    );
+    error.status = response.status >= 500 || response.status === 401
+      ? 502
+      : response.status;
+    error.stripe = data?.error;
+    throw error;
+  }
+
+  return data;
+}
+
+// Constant-time string compare for webhook signatures.
+function safeCompare(a, b) {
+  const bufferA = Buffer.from(String(a));
+  const bufferB = Buffer.from(String(b));
+
+  if (bufferA.length !== bufferB.length) return false;
+
+  return crypto.timingSafeEqual(bufferA, bufferB);
+}
+
+// Verify the "Stripe-Signature" header (t=timestamp,v1=signature).
+function verifyStripeSignature(payload, header, secret, toleranceSeconds = 300) {
+  if (!header || !secret) return false;
+
+  let timestamp = null;
+  const signatures = [];
+
+  for (const part of String(header).split(",")) {
+    const [key, value] = part.split("=");
+
+    if (key === "t") timestamp = value;
+    if (key === "v1") signatures.push(value);
+  }
+
+  if (!timestamp || signatures.length === 0) return false;
+
+  const age = Math.floor(Date.now() / 1000) - Number(timestamp);
+
+  if (!Number.isFinite(age) || age > toleranceSeconds) return false;
+
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(`${timestamp}.${payload}`)
+    .digest("hex");
+
+  return signatures.some((signature) => safeCompare(expected, signature));
+}
+
+function paymentIntentIdOf(session) {
+  if (!session) return null;
+  if (typeof session.payment_intent === "string") return session.payment_intent;
+  return session.payment_intent?.id ?? null;
+}
+
+// Convert a BDT booking amount to the smallest unit of the charge currency.
+function bookingChargeAmount(totalPrice) {
+  const converted = Math.round((Number(totalPrice) / STRIPE_BDT_PER_USD) * 100);
+
+  // Stripe's minimum charge for USD is 50 cents.
+  return Math.max(converted, 50);
+}
+
+// Mark a booking as paid. Safe to call more than once (webhook + success page).
+async function markPaymentPaid(session) {
+  const sessionId = session?.id ?? null;
+  const paymentIntentId = paymentIntentIdOf(session);
+
+  let payment = sessionId
+    ? await db.collection("payments").findOne({ sessionId })
+    : null;
+
+  const bookingId =
+    payment?.bookingId ||
+    session?.metadata?.bookingId ||
+    session?.client_reference_id ||
+    null;
+
+  if (!bookingId || !ObjectId.isValid(bookingId)) {
+    return { ok: false, reason: "booking-not-found" };
+  }
+
+  const booking = await db
+    .collection("bookings")
+    .findOne({ _id: new ObjectId(bookingId) });
+
+  if (!booking) {
+    return { ok: false, reason: "booking-not-found" };
+  }
+
+  // A replayed "completed" event must not un-refund a booking that was already
+  // refunded. A brand new checkout session still gets a fresh pending payment
+  // document, so re-paying after a refund keeps working.
+  if (booking.paymentStatus === "refunded" && payment?.status === "refunded") {
+    return { ok: false, reason: "refunded" };
+  }
+
+  const paidAt = new Date();
+  const amount = Number(booking.totalPrice) || 0;
+
+  const paymentFields = {
+    bookingId: String(bookingId),
+    customerId: booking.customerId,
+    ownerId: booking.ownerId,
+    amount,
+    chargeAmount:
+      session?.amount_total ?? payment?.chargeAmount ?? bookingChargeAmount(amount),
+    currency: session?.currency ?? payment?.currency ?? STRIPE_CURRENCY,
+    status: "paid",
+    sessionId: sessionId ?? payment?.sessionId ?? null,
+    paymentIntentId: paymentIntentId ?? payment?.paymentIntentId ?? null,
+    method: "card",
+    paidAt,
+    updatedAt: paidAt,
+  };
+
+  if (payment) {
+    await db
+      .collection("payments")
+      .updateOne({ _id: payment._id }, { $set: paymentFields });
+  } else {
+    await db.collection("payments").insertOne({
+      ...paymentFields,
+      createdAt: paidAt,
+    });
+  }
+
+  await db.collection("bookings").updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        paymentStatus: "paid",
+        transactionId: paymentIntentId ?? sessionId,
+        paidAt,
+        updatedAt: paidAt,
+      },
+    }
+  );
+
+  return {
+    ok: true,
+    booking: {
+      ...booking,
+      paymentStatus: "paid",
+      transactionId: paymentIntentId ?? sessionId,
+      paidAt,
+      updatedAt: paidAt,
+    },
+  };
+}
+
+async function markPaymentRefunded(charge) {
+  const paymentIntentId =
+    typeof charge?.payment_intent === "string"
+      ? charge.payment_intent
+      : charge?.payment_intent?.id;
+
+  if (!paymentIntentId) return;
+
+  const payment = await db
+    .collection("payments")
+    .findOne({ paymentIntentId });
+
+  await db
+    .collection("payments")
+    .updateOne(
+      { paymentIntentId },
+      { $set: { status: "refunded", updatedAt: new Date() } }
+    );
+
+  if (payment?.bookingId && ObjectId.isValid(payment.bookingId)) {
+    await db
+      .collection("bookings")
+      .updateOne(
+        { _id: new ObjectId(payment.bookingId) },
+        {
+          $set: {
+            paymentStatus: "refunded",
+            updatedAt: new Date(),
+          },
+        }
+      );
+  }
+}
+
+// GET /api/payments/config -> currency + conversion info for the checkout page
+app.get("/api/payments/config", (req, res) => {
+  res.json({
+    currency: STRIPE_CURRENCY,
+    bdtPerUsd: STRIPE_BDT_PER_USD,
+    configured: Boolean(STRIPE_SECRET_KEY),
+  });
+});
+
+// POST /api/payments/checkout -> create a Stripe Checkout Session
+app.post("/api/payments/checkout", verifyToken, async (req, res, next) => {
+  try {
+    const { bookingId } = req.body ?? {};
+
+    if (!ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ message: "Invalid booking id" });
+    }
+
+    const booking = await db
+      .collection("bookings")
+      .findOne({ _id: new ObjectId(bookingId) });
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    if (booking.customerId !== req.user.id) {
+      return res.status(403).json({ message: "This is not your booking" });
+    }
+
+    if (booking.status !== "approved") {
+      return res.status(400).json({
+        message: "The owner must approve this booking before you can pay",
+      });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      return res.status(400).json({ message: "This booking is already paid" });
+    }
+
+    const amount = Number(booking.totalPrice) || 0;
+
+    if (amount <= 0) {
+      return res.status(400).json({ message: "This booking has no payable amount" });
+    }
+
+    const chargeAmount = bookingChargeAmount(amount);
+    const bookingIdString = String(booking._id);
+
+    // Reuse an open Checkout Session so clicking "Pay now" twice does not
+    // create two payable sessions for the same booking.
+    const existingPayment = await db
+      .collection("payments")
+      .findOne({ bookingId: bookingIdString, status: "pending" });
+
+    if (existingPayment?.sessionId) {
+      try {
+        const existingSession = await stripeRequest(
+          `/checkout/sessions/${encodeURIComponent(existingPayment.sessionId)}`,
+          {},
+          "GET"
+        );
+
+        if (existingSession.status === "open" && existingSession.url) {
+          return res.json({
+            url: existingSession.url,
+            sessionId: existingSession.id,
+            amount,
+            chargeAmount: existingSession.amount_total ?? existingPayment.chargeAmount,
+            currency: existingSession.currency ?? existingPayment.currency,
+            reused: true,
+          });
+        }
+
+        if (existingSession.payment_status === "paid") {
+          // The card was charged but the webhook has not landed yet. Confirm it
+          // now instead of opening a second payable session.
+          await markPaymentPaid(existingSession);
+
+          return res.json({
+            paid: true,
+            sessionId: existingSession.id,
+            amount,
+            chargeAmount: existingSession.amount_total ?? existingPayment.chargeAmount,
+            currency: existingSession.currency ?? existingPayment.currency,
+          });
+        }
+
+        if (existingSession.status === "expired") {
+          await db
+            .collection("payments")
+            .updateOne(
+              { _id: existingPayment._id },
+              { $set: { status: "expired", updatedAt: new Date() } }
+            );
+        }
+      } catch {
+        // If Stripe cannot be reached, fall through and create a new session.
+      }
+    }
+
+    const metadata = {
+      bookingId: bookingIdString,
+      customerId: booking.customerId,
+      ownerId: booking.ownerId,
+    };
+
+    const session = await stripeRequest("/checkout/sessions", {
+      mode: "payment",
+      client_reference_id: bookingIdString,
+      customer_email: booking.customerEmail,
+      success_url: `${PAYMENT_RETURN_URL}/payment?status=success&session_id={CHECKOUT_SESSION_ID}&booking_id=${bookingIdString}`,
+      cancel_url: `${PAYMENT_RETURN_URL}/payment?status=cancelled&booking_id=${bookingIdString}`,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: STRIPE_CURRENCY,
+            unit_amount: chargeAmount,
+            product_data: {
+              name: `OnRent rental - ${booking.equipmentName}`.slice(0, 250),
+              description: `${booking.quantity} x ${booking.units} ${booking.rentalType} rental (${booking.startDate} to ${booking.endDate})`.slice(
+                0,
+                250
+              ),
+            },
+          },
+        },
+      ],
+      metadata,
+      payment_intent_data: { metadata },
+    });
+
+    const now = new Date();
+
+    await db.collection("payments").insertOne({
+      bookingId: bookingIdString,
+      customerId: booking.customerId,
+      ownerId: booking.ownerId,
+      amount,
+      chargeAmount: session.amount_total ?? chargeAmount,
+      currency: session.currency ?? STRIPE_CURRENCY,
+      status: "pending",
+      sessionId: session.id,
+      paymentIntentId: paymentIntentIdOf(session),
+      method: "card",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    res.json({
+      url: session.url,
+      sessionId: session.id,
+      amount,
+      chargeAmount: session.amount_total ?? chargeAmount,
+      currency: session.currency ?? STRIPE_CURRENCY,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/payments/webhook -> Stripe tells us the payment succeeded
+app.post("/api/payments/webhook", async (req, res) => {
+  if (!STRIPE_WEBHOOK_SECRET) {
+    return res
+      .status(503)
+      .json({ message: "Stripe webhook secret is not configured" });
+  }
+
+  const rawPayload = req.rawBody ? req.rawBody.toString("utf8") : "";
+
+  if (
+    !verifyStripeSignature(
+      rawPayload,
+      req.headers["stripe-signature"],
+      STRIPE_WEBHOOK_SECRET
+    )
+  ) {
+    return res.status(400).json({ message: "Invalid Stripe signature" });
+  }
+
+  let event;
+
+  try {
+    event = JSON.parse(rawPayload);
+  } catch {
+    return res.status(400).json({ message: "Invalid webhook payload" });
+  }
+
+  try {
+    const session = event.data?.object ?? {};
+
+    if (
+      event.type === "checkout.session.completed" ||
+      event.type === "checkout.session.async_payment_succeeded"
+    ) {
+      // Card payments are already "paid" here; delayed methods may not be.
+      if (
+        event.type === "checkout.session.async_payment_succeeded" ||
+        session.payment_status === "paid"
+      ) {
+        await markPaymentPaid(session);
+      }
+    } else if (event.type === "checkout.session.expired") {
+      await db
+        .collection("payments")
+        .updateOne(
+          { sessionId: session.id },
+          { $set: { status: "expired", updatedAt: new Date() } }
+        );
+    } else if (event.type === "charge.refunded") {
+      await markPaymentRefunded(session);
+    }
+  } catch (error) {
+    console.error("Stripe webhook error:", error.message);
+    return res.status(500).json({ message: "Webhook handling failed" });
+  }
+
+  // Always answer 200 quickly so Stripe does not retry a handled event.
+  res.json({ received: true });
+});
+
+// GET /api/payments/session/:sessionId -> verify a payment after redirect.
+// This keeps local testing working even without the Stripe CLI forwarding
+// webhooks, and it double-checks the webhook in production.
+app.get("/api/payments/session/:sessionId", verifyToken, async (req, res, next) => {
+  try {
+    const { sessionId } = req.params;
+
+    const session = await stripeRequest(
+      `/checkout/sessions/${encodeURIComponent(sessionId)}`,
+      {},
+      "GET"
+    );
+
+    const sessionCustomerId = session.metadata?.customerId;
+
+    if (
+      req.user.role !== "admin" &&
+      sessionCustomerId &&
+      sessionCustomerId !== req.user.id
+    ) {
+      return res.status(403).json({ message: "This payment is not yours" });
+    }
+
+    let booking = null;
+
+    if (session.payment_status === "paid") {
+      const result = await markPaymentPaid(session);
+      booking = result.booking ?? null;
+    }
+
+    if (!booking) {
+      const bookingId =
+        session.metadata?.bookingId || session.client_reference_id;
+
+      if (bookingId && ObjectId.isValid(bookingId)) {
+        booking = await db
+          .collection("bookings")
+          .findOne({ _id: new ObjectId(bookingId) });
+      }
+    }
+
+    res.json({
+      sessionId: session.id,
+      status: session.status,
+      paymentStatus: session.payment_status,
+      amountTotal: session.amount_total,
+      currency: session.currency,
+      booking: booking ? bookingToClient(booking) : null,
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // 404 handler
